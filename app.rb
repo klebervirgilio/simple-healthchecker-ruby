@@ -130,7 +130,7 @@ class HealcheckRoute < WEBrick::HTTPServlet::AbstractServlet
   end
 end
 
-server = WEBrick::HTTPServer.new(Port: 4444)
+server = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
 trap 'INT' do
   server.shutdown
 end
