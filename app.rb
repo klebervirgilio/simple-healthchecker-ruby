@@ -110,23 +110,35 @@ class RedisHealchecker < Healchecker
   end
 end
 
+# Healchecker executable
+module Run
+  module_function
+
+  def run_healthcheck(service)
+    service.new.status
+  end
+
+  def run_healthcheck_for(services)
+    catch(Status::UNHEALTH) do
+      services.each do |service|
+        status = run_healthcheck(service)
+        throw(Status::UNHEALTH, status) unless status.health?
+      end
+      nil
+    end
+  end
+end
+
 SERVICES = [MongoHealchecker, RedisHealchecker].freeze
 
 # HealcheckRoute
 class HealcheckRoute < WEBrick::HTTPServlet::AbstractServlet
   def do_GET(_, response)
-    # check all services
-    unhealth_status = nil
-    catch(Status::UNHEALTH) do
-      SERVICES.each do |service|
-        status = service.new.status
-        throw(Status::UNHEALTH, unhealth_status = status) unless status.health?
-      end
-    end
+    unhealth_status = Run.run_healthcheck_for(SERVICES)
 
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status ? unhealth_status.to_s : 'WORKING'
+    response.body = unhealth_status&.to_s || 'WORKING'
   end
 end
 
