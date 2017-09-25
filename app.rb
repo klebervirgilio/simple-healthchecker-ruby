@@ -15,8 +15,10 @@ end
 
 # healthcheck abstraction
 class Status
-  HEALTH = 'health'.freeze
-  UNHEALTH = 'unhealth'.freeze
+  STATES = {
+    health:   HEALTH = 'health'.freeze,
+    unhealth: UNHEALTH = 'unhealth'.freeze
+  }.freeze
 
   attr_accessor :status, :msg, :name
 
