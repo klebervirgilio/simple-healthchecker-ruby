@@ -1,7 +1,7 @@
 FROM ruby:2.4.1
 
 RUN apt-get update \
-    && apt-get install telnet
+    && apt-get install telnet time
 
 RUN mkdir /app
 WORKDIR /app
