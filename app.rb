@@ -2,6 +2,7 @@ require 'mongo'
 require 'timeout'
 require 'logger'
 require 'redis'
+require 'webrick'
 
 NULL_LOGGER = Logger.new('/dev/null')
 
@@ -61,6 +62,8 @@ class MongoHealchecker < Healchecker
 
   def do_status_check
     client.list_databases
+  ensure
+    client.close
   end
 
   def status
@@ -87,6 +90,8 @@ class RedisHealchecker < Healchecker
 
   def do_status_check
     client.ping
+  ensure
+    client.quit
   end
 
   def status
@@ -105,14 +110,27 @@ end
 
 SERVICES = [MongoHealchecker, RedisHealchecker].freeze
 
-# check all services
-unhealth_status = catch(Status::UNHEALTH) do
-  SERVICES.each do |service|
-    status = service.new.status
-    throw(Status::UNHEALTH, status) unless status.health?
-  end
+# HealcheckRoute
+class HealcheckRoute < WEBrick::HTTPServlet::AbstractServlet
+  def do_GET(_, response)
+    # check all services
+    unhealth_status = nil
+    catch(Status::UNHEALTH) do
+      SERVICES.each do |service|
+        status = service.new.status
+        throw(Status::UNHEALTH, unhealth_status = status) unless status.health?
+      end
+    end
 
-  puts 'WORKING'
+    response.status = 200
+    response['Content-Type'] = 'text/plain'
+    response.body = unhealth_status ? unhealth_status.to_s : 'WORKING'
+  end
 end
 
-puts unhealth_status if unhealth_status
+server = WEBrick::HTTPServer.new(Port: 4444)
+trap 'INT' do
+  server.shutdown
+end
+server.mount '/healthcheck', HealcheckRoute
+server.start
