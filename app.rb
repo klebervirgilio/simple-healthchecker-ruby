@@ -3,6 +3,7 @@ require 'timeout'
 require 'logger'
 require 'redis'
 require 'webrick'
+require 'thread'
 
 NULL_LOGGER = Logger.new('/dev/null')
 
@@ -118,12 +119,31 @@ module Run
     service.new.status
   end
 
-  def run_healthcheck_for(services)
+  def run_healthcheck_for(services, wait=ENV["WAIT"].to_i)
     catch(Status::UNHEALTH) do
       services.each do |service|
         status = run_healthcheck(service)
+        sleep(wait)
         throw(Status::UNHEALTH, status) unless status.health?
       end
+      nil
+    end
+  end
+
+  def run_healthcheck_in_parallel(services, wait=ENV["WAIT"].to_i)
+    semaphore = Mutex.new
+    catch(Status::UNHEALTH) do
+      ts = services.map do |service|
+        Thread.new do
+          status = nil
+          semaphore.synchronize do
+            status = run_healthcheck(service)
+          end
+          sleep(wait)
+          throw(Status::UNHEALTH, status) unless status.health?
+        end
+      end
+      ts.map(&:join)
       nil
     end
   end
@@ -132,13 +152,37 @@ end
 SERVICES = [MongoHealchecker, RedisHealchecker].freeze
 
 # HealcheckRoute
-class HealcheckRoute < WEBrick::HTTPServlet::AbstractServlet
+class Routes < WEBrick::HTTPServlet::AbstractServlet
+  def with_duration
+    start_time = Time.now
+    yield
+    "%.3f" % (Time.now - start_time)
+  end
+end
+
+class HealcheckRoute < Routes
   def do_GET(_, response)
-    unhealth_status = Run.run_healthcheck_for(SERVICES)
+    unhealth_status = nil
+    duration = with_duration do
+      unhealth_status = Run.run_healthcheck_for(SERVICES)
+    end
 
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status&.to_s || 'WORKING'
+    response.body = unhealth_status&.to_s || "WORKING %s ms " % duration
+  end
+end
+
+class ParallelHealcheckRoute < Routes
+  def do_GET(_, response)
+    unhealth_status = nil
+    duration = with_duration do
+      unhealth_status = Run.run_healthcheck_in_parallel(SERVICES)
+    end
+
+    response.status = 200
+    response['Content-Type'] = 'text/plain'
+    response.body = unhealth_status&.to_s || "WORKING %s ms" % duration
   end
 end
 
@@ -147,4 +191,5 @@ trap 'INT' do
   server.shutdown
 end
 server.mount '/healthcheck', HealcheckRoute
+server.mount '/parallel-healthcheck', ParallelHealcheckRoute
 server.start

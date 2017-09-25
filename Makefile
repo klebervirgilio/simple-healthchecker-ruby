@@ -1,6 +1,6 @@
 DC := $(shell command -v docker-compose 2> /dev/null)
 
-default: install-docker
+default: services-down
 	@docker-compose up --remove-orphan -d
 
 start: default
@@ -11,12 +11,23 @@ ifndef DC
 	exit 1
 endif
 
-success_scenario: default
+services-down: install-docker
+	@docker-compose down
+
+success-scenario: default
 	@sleep 1
 	@curl http://localhost:4444/healthcheck
 
-failed_scenario: install-docker
-	@docker-compose down
+parallel-success-scenario: default
+	@sleep 1
+	@curl http://localhost:4444/parallel-healthcheck
+
+failed-scenario: services-down
+	@docker-compose up --remove-orphan -d service
+	@sleep 1
+	@curl http://localhost:4444/healthcheck
+
+parallel-failed-scenario: services-down
 	@docker-compose up --remove-orphan -d service
 	@sleep 1
 	@curl http://localhost:4444/healthcheck
