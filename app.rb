@@ -126,14 +126,14 @@ module Run
     end
   end
 
-  def run_healthcheck_in_parallel(services, wait = ENV['WAIT'].to_i)
-    services.map do |service|
-      Thread.new do
-        QUEUE << run_healthcheck(service)
-        sleep(wait)
-      end
-    end.map(&:join)
-  end
+  # def run_healthcheck_in_parallel(services, wait = ENV['WAIT'].to_i)
+  #   services.map do |service|
+  #     Thread.new do
+  #       QUEUE << run_healthcheck(service)
+  #       sleep(wait)
+  #     end
+  #   end.map(&:join)
+  # end
 end
 
 SERVICES = [MongoHealthcheck, RedisHealthcheck].freeze
@@ -165,20 +165,25 @@ end
 # parallel route
 class ParallelHealthcheckRoute < Route
   def do_GET(_, response)
-    duration = with_duration do
-      Run.run_healthcheck_in_parallel(SERVICES)
-    end
-
-    status = nil
-    2.times do
-      status = QUEUE.pop
-      status = nil if status.health?
-    end
-
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    msg = status&.to_s || 'WORKING'
-    response.body = "#{msg} - #{duration} ms"
+
+    status = nil
+
+    duration = with_duration do
+      SERVICES.map do |service|
+        Thread.new do
+          status = Run.run_healthcheck(service)
+          unless status.health?
+            response.body = status.to_s
+            return
+          end
+        end
+      end.map(&:join)
+    end
+
+    msg = status&.to_s || 
+    response.body = "WORKING - #{duration} ms"
   end
 end
 
