@@ -1,69 +1,58 @@
+# frozen_string_literal: true
+
 require 'mongo'
 require 'timeout'
 require 'logger'
 require 'redis'
 require 'webrick'
-require 'thread'
+require 'concurrent'
 
 NULL_LOGGER = Logger.new('/dev/null')
-
-# healthcheck interface
-module Healthcheckable
-  def status
-    raise NotImplemented
-  end
-end
+SERVER = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
 
 # healthcheck abstraction
 class Status
-  STATES = {
-    health:   HEALTH = 'health'.freeze,
-    unhealth: UNHEALTH = 'unhealth'.freeze
-  }.freeze
+  HEALTH = 'HEALTH'
+  UNHEALTH = 'UNHEALTH'
 
-  attr_accessor :status, :msg, :name
-
-  def self.new_unhealth_status(attrs = {})
-    new(status: UNHEALTH, **attrs)
+  def self.new_unhealth_status(msg = nil)
+    new(status: UNHEALTH, msg: msg)
   end
 
-  def self.new_health_status(attrs = {})
-    new(status: HEALTH, **attrs)
+  def self.new_health_status(msg = nil)
+    new(status: HEALTH, msg: msg)
   end
 
   def initialize(attrs)
     @status = attrs[:status]
     @msg    = attrs[:msg]
-    @name   = attrs[:name]
   end
 
   def health?
-    status == HEALTH
+    @status == HEALTH
   end
 
   def to_s
-    "service: #{name} - msg: #{msg}"
+    "#{@status}: #{@msg}"
   end
 end
 
-# base Healchecker
-class Healchecker
+# base Healthcheck
+class Healthcheck
   private
 
-    def with_timeout(timeout)
-      Timeout.timeout(timeout) { yield }
+    def status
+      raise NotImplemented
     end
 end
 
 # Mongo healthcheck implementation
-class MongoHealchecker < Healchecker
-  include Healthcheckable
-
+class MongoHealthcheck < Healthcheck
   def perform
-    with_timeout(ENV['MONGO_TIMEOUT'].to_i) { do_status_check }
+    Timeout.timeout(ENV['MONGO_TIMEOUT'].to_i) { call }
   end
 
-  def do_status_check
+  def call
     client.list_databases
   ensure
     client.close
@@ -71,11 +60,11 @@ class MongoHealchecker < Healchecker
 
   def status
     perform
-    Status.new_health_status(name: :mongo)
+    Status.new_health_status
   rescue Timeout::Error => e
-    Status.new_unhealth_status(msg: "Mongo Timeout: #{e.message}", name: :mongo)
+    Status.new_unhealth_status("Mongo Timeout: #{e.message}")
   rescue => e
-    Status.new_unhealth_status(msg: e.message, name: :mongo)
+    Status.new_unhealth_status("Mongo ERROR: #{e.message}")
   end
 
   def client
@@ -84,14 +73,12 @@ class MongoHealchecker < Healchecker
 end
 
 # Redis healthcheck implementation
-class RedisHealchecker < Healchecker
-  include Healthcheckable
-
+class RedisHealthcheck < Healthcheck
   def perform
-    with_timeout(ENV['REDIS_TIMEOUT'].to_i) { do_status_check }
+    Timeout.timeout(ENV['REDIS_TIMEOUT'].to_i) { call }
   end
 
-  def do_status_check
+  def call
     client.ping
   ensure
     client.quit
@@ -99,11 +86,11 @@ class RedisHealchecker < Healchecker
 
   def status
     perform
-    Status.new_health_status(name: :redis)
+    Status.new_health_status
   rescue Timeout::Error => e
-    Status.new_unhealth_status(msg: "Redis Timeout: #{e.message}", name: :redis)
+    Status.new_unhealth_status("Redis Timeout: #{e.message}")
   rescue SocketError, Redis::CannotConnectError => e
-    Status.new_unhealth_status(msg: e.message, name: :redis)
+    Status.new_unhealth_status("Redis ERROR: #{e.message}")
   end
 
   def client
@@ -111,85 +98,127 @@ class RedisHealchecker < Healchecker
   end
 end
 
-# Healchecker executable
-module Run
+module Util
+  module_function
+
+  def with_duration
+    start_time = Time.now
+    yield
+    ((Time.now - start_time) * 1e3).to_i
+  end
+end
+
+# Healthcheck executable
+module Runner
   module_function
 
   def run_healthcheck(service)
     service.new.status
   end
 
-  def run_healthcheck_for(services, wait=ENV["WAIT"].to_i)
+  def async_run_healthcheck_for(services)
+    services.map do |service|
+      Concurrent::Future.execute do
+        status = nil
+        duration = Util.with_duration do
+          sleep(ENV['WAIT'].to_i)
+          status = run_healthcheck(service)
+        end
+
+        [status, duration]
+      end
+    end
+  end
+
+  def run_healthcheck_for(services)
     catch(Status::UNHEALTH) do
       services.each do |service|
         status = run_healthcheck(service)
-        sleep(wait)
+        sleep(ENV['WAIT'].to_i)
         throw(Status::UNHEALTH, status) unless status.health?
       end
       nil
     end
   end
+end
 
-  def run_healthcheck_in_parallel(services, wait=ENV["WAIT"].to_i)
-    semaphore = Mutex.new
-    catch(Status::UNHEALTH) do
-      ts = services.map do |service|
-        Thread.new do
-          status = nil
-          semaphore.synchronize do
-            status = run_healthcheck(service)
-          end
-          sleep(wait)
-          throw(Status::UNHEALTH, status) unless status.health?
+SERVICES = [RedisHealthcheck, MongoHealthcheck].freeze
+
+# serial route
+class HealthcheckRoute < WEBrick::HTTPServlet::AbstractServlet
+  def do_GET(_, response)
+    unhealth_status = nil
+    duration = Util.with_duration do
+      unhealth_status = Runner.run_healthcheck_for(SERVICES)
+    end
+
+    response.status = 200
+    response['Content-Type'] = 'text/plain'
+
+    msg = unhealth_status&.to_s || 'WORKING'
+    response.body = "#{msg} - #{duration} ms"
+  end
+end
+
+# parallel route
+class ParallelHealthcheckRoute < WEBrick::HTTPServlet::AbstractServlet
+  def do_GET(_, response)
+    response.status = 200
+    response['Content-Type'] = 'text/plain'
+    promises = nil
+
+    start_time = Time.now
+
+    req_duration = Util.with_duration do
+      promises = Runner.async_run_healthcheck_for(SERVICES)
+      # wait promises to finish
+      until finish?(promises) do
+        give_others_threads_a_chance_to_run
+
+        promises.each do |promise|
+          next unless promise.fulfilled?
+
+          status, duration = promise.value
+          next if status.health?
+
+          return response.body = "#{status} #{duration} ms"
         end
       end
-      ts.map(&:join)
-      nil
+    end
+
+    return response.body = "WORKING #{req_duration} ms" if everything_ok?(promises)
+
+    log_errors(promises)
+    response.body = "ERROR #{req_duration} ms"
+    response.status = 500
+  end
+
+  private
+
+  # give cpu a chance to process the others threads
+  def give_others_threads_a_chance_to_run
+    sleep(1/(200*1e3))
+  end
+
+  def everything_ok?(promises)
+    promises.all?(&:fulfilled?)
+  end
+
+  def finish?(promises)
+    promises.all? { |w| w.fulfilled? || w.rejected? }
+  end
+
+  def log_errors(promises)
+    promises.each do |promise|
+      next unless promise.rejected?
+      SERVER.logger.error(promise.reason)
     end
   end
 end
 
-SERVICES = [MongoHealchecker, RedisHealchecker].freeze
-
-# HealcheckRoute
-class Routes < WEBrick::HTTPServlet::AbstractServlet
-  def with_duration
-    start_time = Time.now
-    yield
-    "%.3f" % (Time.now - start_time)
-  end
-end
-
-class HealcheckRoute < Routes
-  def do_GET(_, response)
-    unhealth_status = nil
-    duration = with_duration do
-      unhealth_status = Run.run_healthcheck_for(SERVICES)
-    end
-
-    response.status = 200
-    response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status&.to_s || "WORKING %s ms " % duration
-  end
-end
-
-class ParallelHealcheckRoute < Routes
-  def do_GET(_, response)
-    unhealth_status = nil
-    duration = with_duration do
-      unhealth_status = Run.run_healthcheck_in_parallel(SERVICES)
-    end
-
-    response.status = 200
-    response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status&.to_s || "WORKING %s ms" % duration
-  end
-end
-
-server = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
 trap 'INT' do
-  server.shutdown
+  SERVER.shutdown
 end
-server.mount '/healthcheck', HealcheckRoute
-server.mount '/parallel-healthcheck', ParallelHealcheckRoute
-server.start
+SERVER.mount '/healthcheck', HealthcheckRoute
+SERVER.mount '/parallel-healthcheck', ParallelHealthcheckRoute
+SERVER.start
