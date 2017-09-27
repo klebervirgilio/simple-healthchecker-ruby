@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require 'mongo'
 require 'timeout'
 require 'logger'
@@ -6,35 +8,29 @@ require 'webrick'
 require 'thread'
 
 NULL_LOGGER = Logger.new('/dev/null')
-
-# healthcheck interface
-module Healthcheckable
-  def status
-    raise NotImplemented
-  end
-end
+QUEUE = Queue.new
+SERVER = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
 
 # healthcheck abstraction
 class Status
   STATES = {
-    health:   HEALTH = 'health'.freeze,
-    unhealth: UNHEALTH = 'unhealth'.freeze
+    health:   HEALTH = 'health',
+    unhealth: UNHEALTH = 'unhealth'
   }.freeze
 
-  attr_accessor :status, :msg, :name
+  attr_accessor :status, :msg
 
-  def self.new_unhealth_status(attrs = {})
-    new(status: UNHEALTH, **attrs)
+  def self.new_unhealth_status(msg = nil)
+    new(status: UNHEALTH, msg: msg)
   end
 
-  def self.new_health_status(attrs = {})
-    new(status: HEALTH, **attrs)
+  def self.new_health_status(msg = nil)
+    new(status: HEALTH, msg: msg)
   end
 
   def initialize(attrs)
     @status = attrs[:status]
     @msg    = attrs[:msg]
-    @name   = attrs[:name]
   end
 
   def health?
@@ -42,13 +38,17 @@ class Status
   end
 
   def to_s
-    "service: #{name} - msg: #{msg}"
+    "#{@status}: #{@msg}"
   end
 end
 
-# base Healchecker
-class Healchecker
+# base Healthcheck
+class Healthcheck
   private
+
+    def status
+      raise NotImplemented
+    end
 
     def with_timeout(timeout)
       Timeout.timeout(timeout) { yield }
@@ -56,9 +56,7 @@ class Healchecker
 end
 
 # Mongo healthcheck implementation
-class MongoHealchecker < Healchecker
-  include Healthcheckable
-
+class MongoHealthcheck < Healthcheck
   def perform
     with_timeout(ENV['MONGO_TIMEOUT'].to_i) { do_status_check }
   end
@@ -71,11 +69,11 @@ class MongoHealchecker < Healchecker
 
   def status
     perform
-    Status.new_health_status(name: :mongo)
+    Status.new_health_status
   rescue Timeout::Error => e
-    Status.new_unhealth_status(msg: "Mongo Timeout: #{e.message}", name: :mongo)
+    Status.new_unhealth_status("Mongo Timeout: #{e.message}")
   rescue => e
-    Status.new_unhealth_status(msg: e.message, name: :mongo)
+    Status.new_unhealth_status("Mongo ERROR: #{e.message}")
   end
 
   def client
@@ -84,9 +82,7 @@ class MongoHealchecker < Healchecker
 end
 
 # Redis healthcheck implementation
-class RedisHealchecker < Healchecker
-  include Healthcheckable
-
+class RedisHealthcheck < Healthcheck
   def perform
     with_timeout(ENV['REDIS_TIMEOUT'].to_i) { do_status_check }
   end
@@ -99,11 +95,11 @@ class RedisHealchecker < Healchecker
 
   def status
     perform
-    Status.new_health_status(name: :redis)
+    Status.new_health_status
   rescue Timeout::Error => e
-    Status.new_unhealth_status(msg: "Redis Timeout: #{e.message}", name: :redis)
+    Status.new_unhealth_status("Redis Timeout: #{e.message}")
   rescue SocketError, Redis::CannotConnectError => e
-    Status.new_unhealth_status(msg: e.message, name: :redis)
+    Status.new_unhealth_status("Redis ERROR: #{e.message}")
   end
 
   def client
@@ -111,7 +107,7 @@ class RedisHealchecker < Healchecker
   end
 end
 
-# Healchecker executable
+# Healthcheck executable
 module Run
   module_function
 
@@ -119,7 +115,7 @@ module Run
     service.new.status
   end
 
-  def run_healthcheck_for(services, wait=ENV["WAIT"].to_i)
+  def run_healthcheck_for(services, wait = ENV['WAIT'].to_i)
     catch(Status::UNHEALTH) do
       services.each do |service|
         status = run_healthcheck(service)
@@ -130,37 +126,29 @@ module Run
     end
   end
 
-  def run_healthcheck_in_parallel(services, wait=ENV["WAIT"].to_i)
-    semaphore = Mutex.new
-    catch(Status::UNHEALTH) do
-      ts = services.map do |service|
-        Thread.new do
-          status = nil
-          semaphore.synchronize do
-            status = run_healthcheck(service)
-          end
-          sleep(wait)
-          throw(Status::UNHEALTH, status) unless status.health?
-        end
+  def run_healthcheck_in_parallel(services, wait = ENV['WAIT'].to_i)
+    services.map do |service|
+      Thread.new do
+        QUEUE << run_healthcheck(service)
+        sleep(wait)
       end
-      ts.map(&:join)
-      nil
-    end
+    end.map(&:join)
   end
 end
 
-SERVICES = [MongoHealchecker, RedisHealchecker].freeze
+SERVICES = [MongoHealthcheck, RedisHealthcheck].freeze
 
-# HealcheckRoute
-class Routes < WEBrick::HTTPServlet::AbstractServlet
+# HealthcheckRoute
+class Route < WEBrick::HTTPServlet::AbstractServlet
   def with_duration
     start_time = Time.now
     yield
-    "%.3f" % (Time.now - start_time)
+    ((Time.now - start_time) * 1e3).to_i
   end
 end
 
-class HealcheckRoute < Routes
+# serial route
+class HealthcheckRoute < Route
   def do_GET(_, response)
     unhealth_status = nil
     duration = with_duration do
@@ -169,27 +157,35 @@ class HealcheckRoute < Routes
 
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status&.to_s || "WORKING %s ms " % duration
+    msg = status&.to_s || 'WORKING'
+    response.body = "#{msg} - #{duration} ms"
   end
 end
 
-class ParallelHealcheckRoute < Routes
+# parallel route
+class ParallelHealthcheckRoute < Route
   def do_GET(_, response)
-    unhealth_status = nil
     duration = with_duration do
-      unhealth_status = Run.run_healthcheck_in_parallel(SERVICES)
+      Run.run_healthcheck_in_parallel(SERVICES)
+    end
+
+    status = nil
+    2.times do
+      status = QUEUE.pop
+      status = nil if status.health?
     end
 
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    response.body = unhealth_status&.to_s || "WORKING %s ms" % duration
+    msg = status&.to_s || 'WORKING'
+    response.body = "#{msg} - #{duration} ms"
   end
 end
 
-server = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
+
 trap 'INT' do
-  server.shutdown
+  SERVER.shutdown
 end
-server.mount '/healthcheck', HealcheckRoute
-server.mount '/parallel-healthcheck', ParallelHealcheckRoute
-server.start
+SERVER.mount '/healthcheck', HealthcheckRoute
+SERVER.mount '/parallel-healthcheck', ParallelHealthcheckRoute
+SERVER.start
