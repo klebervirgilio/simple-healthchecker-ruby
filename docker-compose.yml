@@ -13,7 +13,7 @@ services:
       - MONGO_TIMEOUT=1
       - REDIS_HOST=redis://redis:6379/15
       - REDIS_TIMEOUT=1
-      - WAIT=1
+      - WAIT=2
     working_dir: /app
     volumes:
       - .:/app

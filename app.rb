@@ -8,7 +8,7 @@ require 'webrick'
 require 'thread'
 
 NULL_LOGGER = Logger.new('/dev/null')
-QUEUE = Queue.new
+MUTEX = Mutex.new
 SERVER = WEBrick::HTTPServer.new(Port: ENV['WEB_SERVER_PORT'])
 
 # healthcheck abstraction
@@ -115,28 +115,19 @@ module Run
     service.new.status
   end
 
-  def run_healthcheck_for(services, wait = ENV['WAIT'].to_i)
+  def run_healthcheck_for(services)
     catch(Status::UNHEALTH) do
       services.each do |service|
         status = run_healthcheck(service)
-        sleep(wait)
+        sleep(ENV['WAIT'].to_i)
         throw(Status::UNHEALTH, status) unless status.health?
       end
       nil
     end
   end
-
-  # def run_healthcheck_in_parallel(services, wait = ENV['WAIT'].to_i)
-  #   services.map do |service|
-  #     Thread.new do
-  #       QUEUE << run_healthcheck(service)
-  #       sleep(wait)
-  #     end
-  #   end.map(&:join)
-  # end
 end
 
-SERVICES = [MongoHealthcheck, RedisHealthcheck].freeze
+SERVICES = [RedisHealthcheck, MongoHealthcheck].freeze
 
 # HealthcheckRoute
 class Route < WEBrick::HTTPServlet::AbstractServlet
@@ -157,7 +148,7 @@ class HealthcheckRoute < Route
 
     response.status = 200
     response['Content-Type'] = 'text/plain'
-    msg = status&.to_s || 'WORKING'
+    msg = unhealth_status&.to_s || 'WORKING'
     response.body = "#{msg} - #{duration} ms"
   end
 end
@@ -167,23 +158,23 @@ class ParallelHealthcheckRoute < Route
   def do_GET(_, response)
     response.status = 200
     response['Content-Type'] = 'text/plain'
-
-    status = nil
+    working = []
 
     duration = with_duration do
       SERVICES.map do |service|
         Thread.new do
-          status = Run.run_healthcheck(service)
-          unless status.health?
-            response.body = status.to_s
-            return
+          SERVER.logger.info('start')
+          MUTEX.synchronize do
+            working << Run.run_healthcheck(service)
           end
+          sleep(ENV['WAIT'].to_i)
+          SERVER.logger.info('stop')
         end
       end.map(&:join)
     end
 
-    msg = status&.to_s || 
-    response.body = "WORKING - #{duration} ms"
+    msg = working.all?(&:health?) ? 'WORKING' : working.select { |s| !s.health? }.map(&:to_s).join('\\n')
+    response.body = "#{msg} - #{duration} ms"
   end
 end
 
